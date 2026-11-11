@@ -252,6 +252,18 @@ pub enum Trust {
 }
 
 impl Index {
+    /// Builds `by_id` from the projects an index already holds: everything
+    /// that makes an `Index` calls this once its projects are in (the
+    /// registry's own build included), so no reader ever scans them linearly.
+    fn index_by_id(&mut self) {
+        self.by_id = self
+            .projects
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.id.clone(), i))
+            .collect();
+    }
+
     /// Parses and checks an index (see [`Index::check`]).
     pub fn parse(text: &str) -> Result<Index, String> {
         Self::parse_with(text, false)
@@ -277,12 +289,7 @@ impl Index {
         }
         let mut index: Index =
             serde_json::from_str(text).map_err(|e| format!("mod index: {e}"))?;
-        index.by_id = index
-            .projects
-            .iter()
-            .enumerate()
-            .map(|(i, p)| (p.id.clone(), i))
-            .collect();
+        index.index_by_id();
         index.check_with(local_files)?;
         Ok(index)
     }

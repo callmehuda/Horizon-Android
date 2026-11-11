@@ -671,12 +671,15 @@ pub fn build(src: &Sources) -> Result<Index, Vec<String>> {
     if !errors.is_empty() {
         return Err(errors);
     }
-    let index = Index {
+    let mut index = Index {
         schema: SCHEMA,
         generated: src.generated.clone(),
         projects,
         revoked,
+        by_id: Default::default(),
     };
+    // The registry's build parses no JSON, so `by_id` is built here too.
+    index.index_by_id();
     let local = src.release.starts_with("file:///");
     index.check_with(local).map_err(|e| vec![e])?;
     Ok(index)

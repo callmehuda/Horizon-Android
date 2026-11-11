@@ -1036,7 +1036,14 @@ class LauncherOverhaulTests(unittest.TestCase):
 
     def test_pc_horizon_shader_mod_rain_and_import_parity(self) -> None:
         native_material = (ROOT / "crates/horizon-client-render/src/gfx/native_material.rs").read_text(encoding="utf-8")
-        self.assertIn("override_ident(line)", native_material)
+        # The pack's [vertex] stage (its override constants, helpers and fn vertex) is
+        # linked into the material module by horizon-shader-api's compose, which drops
+        # the declarations the material's own file already holds; the renderer only
+        # adds the input struct and the horizon_vertex_move hook its entries call.
+        stages = (ROOT / "crates/horizon-shader-api/src/stages.rs").read_text(encoding="utf-8")
+        self.assertIn("override_ident(line)", stages)
+        self.assertIn("without_redeclarations", stages)
+        self.assertIn("horizon_vertex_move(input: VertexInput)", native_material)
         self.assertIn("horizon_block_sprite_size()", native_material)
         self.assertIn("vertex_stage_overrides_and_helpers_link_with_material", native_material)
 

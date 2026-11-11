@@ -8,7 +8,7 @@
 //! colour. They read the terrain's group 0, the flat draws' group 1 where those run, and the
 //! pack's frame at group 3.
 
-use horizon_shader_api::{StageKind, check::CheckedStage, stages::GROUP};
+use horizon_shader_api::{check::CheckedStage, stages::GROUP};
 
 use super::native_post::{NativeFrame, present_constants};
 use super::wgsl_prefix::{TERRAIN, native_sprite_arms, prefixed, section, sprite_terrain};
@@ -222,29 +222,14 @@ fn layer_table(name: &str, table: &[(u32, u32)]) -> String {
     out + "        default: { return 0u; }\n    }\n}\n"
 }
 
-fn override_ident(line: &str) -> Option<&str> {
-    let rest = line.trim_start().strip_prefix("override")?;
-    if !rest.starts_with(char::is_whitespace) {
-        return None;
-    }
-    let rest = rest.trim_start();
-    let ident_len = rest
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .map(char::len_utf8)
-        .sum::<usize>();
-    (ident_len > 0).then(|| &rest[..ident_len])
-}
-
-/// Extracts the pack's `[vertex]` stage code after `<prelude>` and shared files
-/// so all `override` constants (e.g. `waving_plants`), helper functions, and `fn vertex`
-/// are linked into the material module without duplicating shared declarations.
+/// What the renderer adds around the pack's material: the vertex input struct
+/// when the pack's own file has not declared it, and the hook its entries call
+/// (`horizon_vertex_move`). The vertex stage's own code — its `override`
+/// constants (e.g. `waving_plants`), helper functions and `fn vertex` — is
+/// already linked into the material stage's source by the check's compose
+/// (`horizon-shader-api`'s `stages.rs`, which also drops the declarations the
+/// material's own file already holds).
 fn vertex_shim(material_source: &str, vertex_stage: Option<&CheckedStage>) -> String {
-    // The vertex stage's own code is already linked into the material stage's
-    // source by the check's compose; what the renderer adds on top is the
-    // input struct when the pack's own file has not declared it, and the hook
-    // its entries call (`horizon_vertex_move`), which is a plain pass-through
-    // without a pack vertex stage.
     let mut out = String::new();
     if !material_source.contains("struct VertexInput {") {
         out += &horizon_shader_api::inputs::VERTEX_INPUT.wgsl();
