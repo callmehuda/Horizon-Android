@@ -72,7 +72,10 @@ fn the_frame_s_wgsl_layout_is_the_uploaded_struct_s() {
     let naga::TypeInner::Struct { members, span } = &ty.inner else {
         panic!("Frame is a struct")
     };
-    assert_eq!(*span as usize, std::mem::size_of::<Frame>());
+    // The 0.1 line shows the 0.1 fields where the uploaded struct carries
+    // them; the tail the 0.2 fields take stays invisible to 0.1, so its span
+    // ends exactly where the 0.2 fields begin.
+    assert_eq!(*span as usize, Frame::OFFSETS[Frame::FIELDS_0_1]);
     let wgsl: Vec<_> = members
         .iter()
         .map(|m| (m.name.clone().unwrap(), m.offset as usize))
@@ -82,6 +85,7 @@ fn the_frame_s_wgsl_layout_is_the_uploaded_struct_s() {
         .iter()
         .zip(Frame::OFFSETS)
         .map(|(f, &o)| (f.name.to_owned(), o))
+        .take(Frame::FIELDS_0_1)
         .collect();
     assert_eq!(wgsl, rust);
 }

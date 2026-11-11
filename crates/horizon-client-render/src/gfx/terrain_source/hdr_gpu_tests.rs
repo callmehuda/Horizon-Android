@@ -387,7 +387,7 @@ fn settled_terrain_preserves_fog_lighting_alpha_and_emissive_masks() {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
     let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
-    let source = super::terrain_shader(false);
+    let source = super::terrain_shader(false, 8);
     for alpha in [0, 64, 127, 128, 255] {
         for variant in 0..36 {
             let expected =
@@ -404,7 +404,7 @@ fn specialized_sampling_preserves_textured_edges_and_cutouts() {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
     let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
-    let source = super::terrain_shader(false);
+    let source = super::terrain_shader(false, 8);
     let expected = render_specialized(&device, &queue, &source, 36, false, 255, true, 1);
     let actual = render_specialized(&device, &queue, &source, 36, true, 255, true, 2);
     assert!(
@@ -420,8 +420,8 @@ fn packed_interface_preserves_rgb_fog_fade_and_all_hdr_tiers_on_gpu() {
     let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
     let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
     for variant in 0..36 {
-        let original = render(&device, &queue, &super::terrain_shader(false), variant);
-        let packed = render(&device, &queue, &super::terrain_shader(true), variant);
+        let original = render(&device, &queue, &super::terrain_shader(false, 8), variant);
+        let packed = render(&device, &queue, &super::terrain_shader(true, 8), variant);
         assert_eq!(original, packed, "RGB/alpha differs for scene {variant}");
         if variant >= 4 {
             assert_eq!(
@@ -460,7 +460,7 @@ fn split_opaque_cutout_preserves_pixels_for_alpha_fog_fade_and_emission() {
     let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
     for alpha in [0, 64, 127, 128, 255] {
         for variant in 0..36 {
-            let source = super::terrain_shader(false);
+            let source = super::terrain_shader(false, 8);
             let original = render_paths(&device, &queue, &source, variant, false, alpha, true);
             let split = render_paths(&device, &queue, &source, variant, true, alpha, true);
             assert_eq!(original, split, "scene {variant}, texture alpha {alpha}");
@@ -473,7 +473,7 @@ fn static_cutout_preserves_alpha_threshold_fog_and_hdr_without_fading() {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
     let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
-    let source = super::terrain_shader(false);
+    let source = super::terrain_shader(false, 8);
     let specialized = source.replace("return solid_color(in);", "return fs_cutout_static(in);");
     // Calling a fragment entry point as a helper is forbidden by WGSL; rename
     // only its declaration in this independently rendered comparison module.

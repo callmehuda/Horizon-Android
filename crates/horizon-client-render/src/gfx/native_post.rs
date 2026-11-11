@@ -107,6 +107,10 @@ pub struct NativeFrame {
     pub(super) buffer: wgpu::Buffer,
     /// Group 3 of the sky and material stages.
     pub layout: wgpu::BindGroupLayout,
+    /// The sampled textures `layout` binds to the fragment stage, counted as
+    /// the layout is built: the material pipeline's budget check compares
+    /// them with the device's per-stage limit (16 on GLES phones).
+    pub fragment_textures: usize,
     /// The pack's `[[textures]]` and their samplers, bound for every stage.
     pub textures: Vec<(wgpu::TextureView, wgpu::Sampler)>,
     /// The colour of block light around the camera (`[[lights]]`), bindings 9 and 10.
@@ -267,6 +271,14 @@ impl NativeFrame {
         ];
         entries.extend(block_light_entries);
         entries.extend(pack_texture_entries(textures.len()));
+        // The sampled textures this layout binds to the fragment stage: the
+        // material pipeline's budget check counts them against the GLES
+        // limit (16 on the phones without Vulkan).
+        let fragment_textures = entries
+            .iter()
+            .filter(|e| e.visibility.contains(wgpu::ShaderStages::FRAGMENT))
+            .filter(|e| matches!(e.ty, wgpu::BindingType::Texture { .. }))
+            .count();
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Native shader pack frame"),
             entries: &entries,
@@ -332,6 +344,7 @@ impl NativeFrame {
             pbr,
             buffer,
             layout,
+            fragment_textures,
             group,
             opaque_depth,
             opaque_color,
@@ -660,6 +673,23 @@ impl NativePost {
             .extend((0..targets.len() as u32).map(|j| {
                 texture_entry(horizon_shader_api::stages::POST_TARGET_BINDING + j, float)
             }));
+        // As the frame's: over the device's per-stage limit the layout is
+        // refused with a validation error nothing points at the pack, so
+        // count first and say what to drop.
+        let fragment_textures = entries
+            .iter()
+            .filter(|e| e.visibility.contains(wgpu::ShaderStages::FRAGMENT))
+            .filter(|e| matches!(e.ty, wgpu::BindingType::Texture { .. }))
+            .count();
+        let limit = device.limits().max_sampled_textures_per_shader_stage as usize;
+        if fragment_textures > limit {
+            return Err(format!(
+                "the post's fragment stage binds {} sampled textures (the prelude's, the \
+                 pack's [[textures]] and its targets): this device allows {} per stage — drop \
+                 reads you can, or merge small textures into an atlas or a texture array",
+                fragment_textures, limit
+            ));
+        }
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Native shader pack post"),
             entries: &entries,

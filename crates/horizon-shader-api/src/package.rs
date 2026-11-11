@@ -56,12 +56,29 @@ pub fn is_pack(path: &Path) -> bool {
 impl Pack {
     /// Reads only the manifest, without loading or validating shader source.
     pub fn read_manifest(path: &Path) -> Result<Manifest, String> {
-        if path.is_file()
-            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-            && let Some(builtin) = builtin_shader_pack(stem)
-        {
-            return Ok(builtin.manifest);
+        // Read what is on the disk as it lies: the game writes its builtins as
+        // real files, and what a player edits of them has to be read exactly
+        // as it is. Only a file that cannot be opened at all falls back to the
+        // builtin copy; once its bytes can be read they are the pack, however
+        // they parse.
+        match Self::read_manifest_from_disk(path) {
+            Ok(manifest) => Ok(manifest),
+            Err(err) => fall_back_to_builtin_manifest(path, err),
         }
+    }
+
+    /// Reads `path`: a `.hshader` file, or a folder (its hidden files and
+    /// folders, such as `.git`, are skipped).
+    pub fn read(path: &Path) -> Result<Pack, String> {
+        // As `read_manifest`: the disk first, as it lies.
+        match Self::read_from_disk(path) {
+            Ok(pack) => Ok(pack),
+            Err(err) => fall_back_to_builtin_pack(path, err),
+        }
+    }
+
+    /// Reads `path`'s manifest from the disk, verbatim.
+    fn read_manifest_from_disk(path: &Path) -> Result<Manifest, String> {
         let file = std::fs::File::open(if path.is_dir() {
             path.join(MANIFEST)
         } else {
@@ -85,20 +102,14 @@ impl Pack {
         Manifest::parse(&text)
     }
 
-    /// Reads `path`: a `.hshader` file, or a folder (its hidden files and
-    /// folders, such as `.git`, are skipped).
-    pub fn read(path: &Path) -> Result<Pack, String> {
-        if path.is_file()
-            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-            && let Some(builtin) = builtin_shader_pack(stem)
-        {
-            return Ok(builtin);
-        }
+    /// Reads `path`'s files from the disk, verbatim.
+    fn read_from_disk(path: &Path) -> Result<Pack, String> {
         let mut files = BTreeMap::new();
         if path.is_dir() {
             read_dir(path, "", &mut files)?;
         } else {
-            let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let file =
+                std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
             let mut zip = zip::ZipArchive::new(file)
                 .map_err(|e| format!("{}: not a .{EXTENSION} (zip): {e}", path.display()))?;
             if zip.len() > MAX_ENTRIES {
@@ -213,6 +224,32 @@ impl Pack {
     pub fn sha256(&self) -> Result<String, String> {
         Ok(sha256_hex(&self.package()?))
     }
+}
+
+/// A builtin whose file cannot be opened at all (the game could not write it
+/// out) falls back to its embedded manifest; a file that opened but does not
+/// parse is the player's, broken as it lies.
+fn fall_back_to_builtin_manifest(path: &Path, err: String) -> Result<Manifest, String> {
+    if path.is_file()
+        && std::fs::File::open(path).is_err()
+        && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+        && let Some(builtin) = builtin_shader_pack(stem)
+    {
+        return Ok(builtin.manifest);
+    }
+    Err(err)
+}
+
+/// The pack twin of [`fall_back_to_builtin_manifest`].
+fn fall_back_to_builtin_pack(path: &Path, err: String) -> Result<Pack, String> {
+    if path.is_file()
+        && std::fs::File::open(path).is_err()
+        && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+        && let Some(builtin) = builtin_shader_pack(stem)
+    {
+        return Ok(builtin);
+    }
+    Err(err)
 }
 
 /// SHA-256 in lowercase hex.
@@ -841,7 +878,18 @@ fn material(input: MaterialInput) -> Surface {
         let wave_normal = normalize(input.normal + vec3<f32>(wave.x * 9.0, 0.0, wave.y * 9.0));
         let view_dir = normalize(-input.position);
         let fresnel = clamp(0.24 + 0.68 * pow(1.0 - max(dot(wave_normal, view_dir), 0.0), 3.2), 0.22, 0.92);
-        let scene_z = linear_depth(opaque_depth(input.screen));
+        // The scene behind this water pixel: the world's depth here, loaded
+        // and unprojected through the frame, its distance from the camera
+        // (what `dist` holds for the water surface itself).
+        let depth_texel = vec2<i32>(clamp(
+            input.screen * frame.resolution,
+            vec2<f32>(0.0),
+            frame.resolution - vec2<f32>(1.0),
+        ));
+        let depth = textureLoad(opaque_depth, depth_texel, 0);
+        let clip = vec4<f32>(input.screen.x * 2.0 - 1.0, 1.0 - input.screen.y * 2.0, depth, 1.0);
+        let unprojected = frame.projection_inverse * clip;
+        let scene_z = length((frame.view_inverse * vec4<f32>(unprojected.xyz / unprojected.w, 0.0)).xyz);
         let water_depth = max(scene_z - dist, 0.0);
         let depth_absorb = clamp(1.0 - exp(-water_depth * 0.32), 0.0, 1.0);
         let shallow_water = mix(vec3<f32>(0.10, 0.52, 0.66), vec3<f32>(0.04, 0.20, 0.34), night) * input.lightmap;
@@ -996,7 +1044,7 @@ fn vertex(input: VertexInput) -> vec3<f32> {
     let gust = 0.75 + 0.35 * sin(frame.time * 0.8 + world.x * 0.12);
     let wave = sin(frame.time * 3.1 + world.x * 0.85 + world.z * 0.65 + world.y * 0.4) * gust;
     let is_biome_foliage = input.tint.g > input.tint.r * 1.06 && input.tint.g > input.tint.b * 1.06;
-    if (input.tags & 1u) != 0u || is_biome_foliage {
+    if is_biome_foliage {
         pos.x += wave * wind_strength;
         pos.z += cos(frame.time * 2.4 + world.z * 0.75 + world.x * 0.35) * wind_strength * 0.65;
         pos.y += sin(frame.time * 4.2 + world.x + world.z) * wind_strength * 0.22;
@@ -1230,7 +1278,18 @@ fn material(input: MaterialInput) -> Surface {
     let caustic = pow(max(sin(world.x * 2.6 + frame.time * 2.8) * cos(world.z * 2.6 - frame.time * 2.2), 0.0), 2.0);
     if input.fluid == 1u {
         let dist = length(input.position);
-        let scene_z = linear_depth(opaque_depth(input.screen));
+        // The scene behind this water pixel: the world's depth here, loaded
+        // and unprojected through the frame, its distance from the camera
+        // (what `dist` holds for the water surface itself).
+        let depth_texel = vec2<i32>(clamp(
+            input.screen * frame.resolution,
+            vec2<f32>(0.0),
+            frame.resolution - vec2<f32>(1.0),
+        ));
+        let depth = textureLoad(opaque_depth, depth_texel, 0);
+        let clip = vec4<f32>(input.screen.x * 2.0 - 1.0, 1.0 - input.screen.y * 2.0, depth, 1.0);
+        let unprojected = frame.projection_inverse * clip;
+        let scene_z = length((frame.view_inverse * vec4<f32>(unprojected.xyz / unprojected.w, 0.0)).xyz);
         let water_depth = max(scene_z - dist, 0.0);
         let absorb = clamp(1.0 - exp(-water_depth * 0.26), 0.0, 1.0);
         let shallow = vec3<f32>(0.18, 0.92, 0.86) * input.lightmap;

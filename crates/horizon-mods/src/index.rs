@@ -33,6 +33,11 @@ pub struct Index {
     pub projects: Vec<Project>,
     #[serde(default)]
     pub revoked: Vec<Revoked>,
+    /// The projects by id, built when the index is parsed: the registry is
+    /// parsed once and asked for ids many times (browsing, dependencies,
+    /// installs), each a linear scan before.
+    #[serde(skip)]
+    pub by_id: std::collections::HashMap<String, usize>,
 }
 
 /// What a project is. New kinds (data packs, worlds, themes) can be added
@@ -270,7 +275,14 @@ impl Index {
                 head.schema
             ));
         }
-        let index: Index = serde_json::from_str(text).map_err(|e| format!("mod index: {e}"))?;
+        let mut index: Index =
+            serde_json::from_str(text).map_err(|e| format!("mod index: {e}"))?;
+        index.by_id = index
+            .projects
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.id.clone(), i))
+            .collect();
         index.check_with(local_files)?;
         Ok(index)
     }
@@ -403,7 +415,7 @@ impl Index {
         })
     }
     pub fn project(&self, id: &str) -> Option<&Project> {
-        self.projects.iter().find(|p| p.id == id)
+        self.by_id.get(id).map(|&i| &self.projects[i])
     }
 
     /// Why the file of `id` with this hash was taken down, if it was.

@@ -380,11 +380,19 @@ impl<'a, W: Write> Writer<'a, W> {
                     // The trailing space is important
                     write!(self.out, "uniform ")?;
 
+                    // A depth image only becomes a shadow sampler where this
+                    // entry point samples it for comparison (see
+                    // `write_image_type`).
+                    let shadow = match class {
+                        crate::ImageClass::Depth { multi: false } => self.depth_image_is_compared(handle),
+                        _ => false,
+                    };
+
                     // write the type
                     //
                     // This is way we need the leading space because `write_image_type` doesn't add
                     // any spaces at the beginning or end
-                    self.write_image_type(dim, arrayed, class)?;
+                    self.write_image_type(dim, arrayed, class, shadow)?;
 
                     // Finally write the name and end the global with a `;`
                     // The leading space is important
@@ -573,6 +581,7 @@ impl<'a, W: Write> Writer<'a, W> {
         dim: crate::ImageDimension,
         arrayed: bool,
         class: crate::ImageClass,
+        shadow: bool,
     ) -> BackendResult {
         // glsl images consist of four parts the scalar prefix, the image "type", the dimensions
         // and modifiers
@@ -596,12 +605,13 @@ impl<'a, W: Write> Writer<'a, W> {
             Ic::Sampled { kind, multi: true } => ("sampler", S { kind, width: 4 }, "MS", ""),
             Ic::Sampled { kind, multi: false } => ("sampler", S { kind, width: 4 }, "", ""),
             Ic::Depth { multi: true } => ("sampler", float, "MS", ""),
-            Ic::Depth { multi: false } => {
-                let has_cmp = self.module.types.iter().any(|(_, ty)| {
-                    matches!(ty.inner, TypeInner::Sampler { comparison: true })
-                });
-                ("sampler", float, "", if has_cmp { "Shadow" } else { "" })
-            }
+            // A depth image is a shadow sampler only where the entry point
+            // actually samples it for comparison: one that is only
+            // `texelFetch`ed must stay a plain `sampler2D`, since
+            // `texelFetch` does not exist for shadow samplers in GLSL ES
+            // 3.0 (that is what the depth-reading passes, TAA's
+            // reprojection say, do on GLES phones).
+            Ic::Depth { multi: false } => ("sampler", float, "", if shadow { "Shadow" } else { "" }),
             Ic::Storage { format, .. } => ("image", format.into(), "", ""),
             Ic::External => unimplemented!(),
         };
@@ -625,6 +635,34 @@ impl<'a, W: Write> Writer<'a, W> {
         )?;
 
         Ok(())
+    }
+
+    /// Whether this entry point samples `image` with a comparison sampler:
+    /// that is the only thing that makes it a shadow sampler, since a module
+    /// that only loads its depth textures must keep `texelFetch`, which
+    /// shadow samplers lack in GLSL ES 3.0.
+    fn depth_image_is_compared(&self, image: Handle<crate::GlobalVariable>) -> bool {
+        let ep_info = self.info.get_entry_point(self.entry_point_idx as usize);
+        ep_info.sampling_set.iter().any(|key| {
+            key.image == image
+                && matches!(
+                    self.module.types[self.module.global_variables[key.sampler].ty].inner,
+                    TypeInner::Sampler { comparison: true }
+                )
+        })
+    }
+
+    /// Whether this entry point samples anything for comparison, for image
+    /// types written where the image is a function parameter and the global
+    /// it will sample is not known here.
+    fn any_comparison_sample(&self) -> bool {
+        let ep_info = self.info.get_entry_point(self.entry_point_idx as usize);
+        ep_info.sampling_set.iter().any(|key| {
+            matches!(
+                self.module.types[self.module.global_variables[key.sampler].ty].inner,
+                TypeInner::Sampler { comparison: true }
+            )
+        })
     }
 
     /// Helper method used by [Self::write_global] to write just the layout part of
@@ -1288,11 +1326,15 @@ impl<'a, W: Write> Writer<'a, W> {
                         write!(this.out, "layout({}) ", glsl_storage_format(format)?)?;
                     }
 
+                    // A depth image parameter is a shadow sampler only where
+                    // the entry point samples something for comparison (see
+                    // `write_image_type`).
+                    //
                     // write the type
                     //
                     // This is way we need the leading space because `write_image_type` doesn't add
                     // any spaces at the beginning or end
-                    this.write_image_type(dim, arrayed, class)?;
+                    this.write_image_type(dim, arrayed, class, this.any_comparison_sample())?;
                 }
                 TypeInner::Pointer { base, .. } => {
                     // write parameter qualifiers

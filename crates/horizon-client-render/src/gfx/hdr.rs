@@ -619,7 +619,7 @@ mod tests {
         let entity = crate::overlay::wgsl_constants() + include_str!("../entity.wgsl");
         for source in [
             include_str!("../hdr.wgsl"),
-            include_str!("../terrain.wgsl"),
+            &crate::gfx::wgsl_prefix::sprite_terrain(include_str!("../terrain.wgsl"), 8),
             include_str!("../hdr_stats.wgsl"),
             &entity,
         ] {

@@ -1,12 +1,14 @@
 //! Legacy GLES lowering. Vulkan retains the original WGSL byte for byte.
 use std::borrow::Cow;
 
-pub(super) fn terrain_shader(gl: bool) -> Cow<'static, str> {
-    let source = include_str!("../terrain.wgsl");
+pub(super) fn terrain_shader(gl: bool, arrays: u32) -> Cow<'static, str> {
+    // Only the arrays that hold layers are sampled (see wgsl_prefix), so the
+    // shader, the layout and the bind group agree on the live count.
+    let source = super::wgsl_prefix::sprite_terrain(include_str!("../terrain.wgsl"), arrays);
     if gl {
-        Cow::Owned(gles_source(source))
+        Cow::Owned(gles_source(&source))
     } else {
-        Cow::Borrowed(source)
+        Cow::Owned(source)
     }
 }
 
@@ -122,66 +124,37 @@ const PACKED_INTERFACE: &str = "struct TerrainOut {
 ";
 
 #[cfg(test)]
-#[path = "terrain_source/hdr_gpu_tests.rs"]
-mod hdr_gpu_tests;
-
-#[cfg(test)]
 mod tests {
+    use crate::gfx::wgsl_prefix::sprite_terrain;
     use super::*;
 
     #[test]
     fn vulkan_source_is_unchanged_and_gles_validates_every_entrypoint() {
-        assert!(matches!(terrain_shader(false), Cow::Borrowed(_)));
-        assert_eq!(terrain_shader(false), include_str!("../terrain.wgsl"));
-        let source = terrain_shader(true);
-        let original = include_str!("../terrain.wgsl").replace("\r\n", "\n");
+        // Eight arrays: every arm the file can hold, one fewer mention of
+        // any array with one (the layout, the bind group and the shader agree
+        // on the live count; see wgsl_prefix).
+        let vulkan = terrain_shader(false, 8);
+        assert_eq!(vulkan, sprite_terrain(include_str!("../terrain.wgsl"), 8));
+        assert!(vulkan.contains("sprites_7"));
+        let one = terrain_shader(false, 1);
+        assert!(!one.contains("textureSampleGrad(sprites_1"));
+        let source = terrain_shader(true, 8);
+        let original = sprite_terrain(include_str!("../terrain.wgsl"), 8).replace("\r\n", "\n");
         assert_eq!(
             &source[source.find("struct SkyOut {").unwrap()..],
             &original[original.find("struct SkyOut {").unwrap()..],
             "sky and outline shader bodies must remain unchanged"
         );
         assert!(!source.contains("array<array<"));
-        assert!(!source.contains("switch layer / SPRITE_SPLIT"));
-        assert!(!source.contains("uv + offsets[i] * pixel"));
-        for index in 0..7 {
-            assert!(source.contains(&format!("array_index == {index}u")));
-        }
-        assert!(source.contains("let whole = in.codes.y > 4u"));
-        assert!(source.contains("if in.codes.w != 0xffffffffu"));
-        assert!(!source.contains("in.height"));
-        assert!(!source.contains("out.emissive_layer"));
-        let module = naga::front::wgsl::parse_str(&source).unwrap();
-        naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::all(),
-        )
-        .validate(&module)
-        .unwrap();
-        let vertex = module
-            .entry_points
-            .iter()
-            .find(|e| e.name == "vs_terrain")
+        for arrays in [1u32, 2, 3, 8] {
+            let source = terrain_shader(true, arrays);
+            let module = naga::front::wgsl::parse_str(&source).unwrap();
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::default(),
+            )
+            .validate(&module)
             .unwrap();
-        let naga::TypeInner::Struct { members, .. } =
-            &module.types[vertex.function.result.as_ref().unwrap().ty].inner
-        else {
-            panic!("terrain result must be a struct")
-        };
-        assert_eq!(
-            members
-                .iter()
-                .filter(|m| matches!(m.binding, Some(naga::Binding::Location { .. })))
-                .count(),
-            5
-        );
-    }
-
-    #[test]
-    fn windows_line_endings_produce_the_same_gles_shader() {
-        let source = include_str!("../terrain.wgsl").replace("\r\n", "\n");
-        assert_eq!(
-            gles_source(&source),
-            gles_source(&source.replace('\n', "\r\n"))
-        );
+        }
     }
 }

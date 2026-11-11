@@ -447,7 +447,39 @@ const SECTION_UPLOAD_CHUNK: u64 = 4 << 20;
 pub mod upload_budget;
 /// Section copies are submitted early past this many staged bytes, which
 /// bounds the staging memory frames that are not drawn can hold.
-const SECTION_COPY_LIMIT: u64 = 64 << 20;
+/// How many bytes of section (chunk) mesh uploads may sit in the frame's
+/// encoder before it is submitted early. 64 MiB keeps the encoder cheap on
+/// desktops; the phones this runs on without Vulkan have 3-4 GB of RAM, where
+/// half of that both cuts the worst hitch while a world's chunks load (the
+/// span `upload_submit`) and halves the peak the arena is allowed to reach.
+/// Measure it with `HORIZON_SPIKES=MS` (the span `upload_submit`) and the
+/// Android performance recorder before and after changing it.
+fn section_copy_limit() -> u64 {
+    if low_memory() {
+        32 << 20
+    } else {
+        64 << 20
+    }
+}
+
+/// Whether this device is one of the small ones (around 4 GB of RAM, the
+/// phones without Vulkan), from /proc/meminfo where it exists.
+fn low_memory() -> bool {
+    static LOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LOW.get_or_init(|| {
+        std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|text| {
+                text.lines().find_map(|line| {
+                    let rest = line.strip_prefix("MemTotal:")?;
+                    rest.trim()
+                        .strip_suffix(" kB")
+                        .and_then(|kb| kb.parse::<u64>().ok())
+                })
+            })
+            .is_some_and(|kb| kb < 5 * 1024 * 1024)
+    })
+}
 pub struct Frame<'a> {
     pub camera: DVec3,
     pub yaw: f32,
@@ -1042,7 +1074,10 @@ fn sprite_views(
     unused: &wgpu::TextureView,
     mips: Option<u32>,
 ) -> Vec<wgpu::TextureView> {
-    (0..SPRITE_ARRAYS as usize)
+    // One view per array that holds layers: the layout, the bind group and
+    // the shader agree on the live count (see the terrain bindings), and a
+    // blank fills a slot only while its array has yet to be filled.
+    (0..textures.len().max(1))
         .map(|i| match textures.get(i) {
             Some(t) => t.create_view(&wgpu::TextureViewDescriptor {
                 dimension: Some(wgpu::TextureViewDimension::D2Array),
@@ -1089,44 +1124,33 @@ fn terrain_group(
         binding,
         resource: wgpu::BindingResource::TextureView(view),
     };
+    // One entry per array that holds layers, at 5.., however many there are;
+    // a blank view never takes a slot the layout does not have (the layout,
+    // the bind group and the shader agree on the live count; see the terrain
+    // bindings and `sprite_terrain`).
+    let mut entries = vec![
+        wgpu::BindGroupEntry {
+            binding: 0,
+            resource: globals.as_entire_binding(),
+        },
+        view(1, &sprites[0]),
+        wgpu::BindGroupEntry {
+            binding: 2,
+            resource: wgpu::BindingResource::Sampler(sprite_sampler),
+        },
+        view(3, lightmap),
+        wgpu::BindGroupEntry {
+            binding: 4,
+            resource: wgpu::BindingResource::Sampler(lightmap_sampler),
+        },
+    ];
+    entries.extend((1..sprites.len() as u32).map(|i| view(4 + i, &sprites[i as usize])));
+    entries.push(view(12, emission_thresholds));
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some(label),
         layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: globals.as_entire_binding(),
-            },
-            view(1, &sprites[0]),
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::Sampler(sprite_sampler),
-            },
-            view(3, lightmap),
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: wgpu::BindingResource::Sampler(lightmap_sampler),
-            },
-            view(5, &sprites[1]),
-            view(6, &sprites[2]),
-            view(7, &sprites[3]),
-            view(8, &sprites[4]),
-            view(9, &sprites[5]),
-            view(10, &sprites[6]),
-            view(11, &sprites[7]),
-            view(12, emission_thresholds),
-        ],
+        entries: &entries,
     })
-}
-/// CPU texture uploads prepared by the resource worker. Consumed by renderer
-/// construction so the temporary mip chains are released after GPU upload.
-pub struct PreparedTextures {
-    sprites: Vec<(Vec<u8>, u32)>,
-    /// The sprite layers per array `sprites` is cut by.
-    split: u32,
-    forcefield: (Vec<u8>, u32),
-    /// The LabPBR maps' mip chains (normals, specular), their levels, layers and size.
-    pbr: Option<(Vec<u8>, Vec<u8>, u32, u32, u32)>,
 }
 /// Every level of `layers` square RGBA layers of `size`, each the mean of four texels of the
 /// one above, layer major: the LabPBR maps' mips (their channels are data, not colour).
@@ -1157,6 +1181,18 @@ fn box_mip_chain(pixels: &[u8], size: u32, layers: u32) -> Vec<u8> {
     }
     out
 }
+/// CPU texture uploads prepared by the resource worker. Consumed by renderer
+/// construction so the temporary mip chains are released after GPU upload.
+pub struct PreparedTextures {
+    sprites: Vec<(Vec<u8>, u32)>,
+    /// The sprite layers per array `sprites` is cut by.
+    split: u32,
+    forcefield: (Vec<u8>, u32),
+    /// The LabPBR maps' mip chains (normals, specular), their levels, layers
+    /// and size.
+    pbr: Option<(Vec<u8>, Vec<u8>, u32, u32, u32)>,
+}
+
 impl PreparedTextures {
     pub fn new(
         pixels: &[u8],
@@ -1973,10 +2009,25 @@ impl Renderer {
         } else {
             timing::GpuTimer::new(&device, &queue)
         };
+        // GLES binds at most 16 sampled textures to a stage, and the terrain's
+        // group 0 spends one per sprite array: only the arrays that hold
+        // layers are declared, sampled and bound, so a vanilla-sized world
+        // (one array) leaves the stage's budget for a shader pack's frame.
+        // A renderer whose array count would change is rebuilt (see
+        // `matches_sprite_layout`), so the count here is the live one.
+        let sprite_arrays = layers.div_ceil(split).max(1);
+        if sprite_arrays > 1 {
+            log::info!("Horizon: {layers} block textures in {sprite_arrays} arrays");
+        }
+        let sprite_constants = [
+            ("SPRITE_ARRAYS", f64::from(sprite_arrays)),
+            ("SPRITE_SPLIT", f64::from(split)),
+        ];
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Horizon terrain"),
             source: wgpu::ShaderSource::Wgsl(terrain_shader(
                 adapter.get_info().backend == wgpu::Backend::Gl,
+                sprite_arrays,
             )),
         });
         let entry = |binding, visibility, ty| wgpu::BindGroupLayoutEntry {
@@ -1991,71 +2042,62 @@ impl Renderer {
             view_dimension: wgpu::TextureViewDimension::D2Array,
             multisampled: false,
         };
-        let sprite_arrays = layers.div_ceil(split).max(1);
-        if sprite_arrays > 1 {
-            log::info!("Horizon: {layers} block textures in {sprite_arrays} arrays");
-        }
-        let sprite_constants = [
-            ("SPRITE_ARRAYS", f64::from(sprite_arrays)),
-            ("SPRITE_SPLIT", f64::from(split)),
+        // One entry per array that holds layers: `sprites_1..` at 5..,
+        // however many there are, none with one array. GLES binds at most 16
+        // sampled textures to a stage; a vanilla-sized world (one array)
+        // leaves the stage's budget for a shader pack's frame.
+        let mut terrain_entries = vec![
+            entry(
+                0,
+                vf,
+                wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+            ),
+            entry(
+                1,
+                vf,
+                wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+            ),
+            entry(
+                1 + 1,
+                vf,
+                wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            ),
+            entry(
+                3,
+                vf,
+                wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+            ),
+            entry(
+                4,
+                vf,
+                wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            ),
         ];
+        terrain_entries.extend((1..sprite_arrays).map(|i| entry(4 + i, vf, sprite_array)));
+        terrain_entries.push(entry(
+            12,
+            vf,
+            wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+        ));
         let bindings = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Horizon terrain bindings"),
-            entries: &[
-                entry(
-                    0,
-                    vf,
-                    wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                ),
-                entry(
-                    1,
-                    vf,
-                    wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
-                        multisampled: false,
-                    },
-                ),
-                entry(
-                    1 + 1,
-                    vf,
-                    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                ),
-                entry(
-                    3,
-                    vf,
-                    wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                ),
-                entry(
-                    4,
-                    vf,
-                    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                ),
-                entry(5, vf, sprite_array),
-                entry(6, vf, sprite_array),
-                entry(7, vf, sprite_array),
-                entry(8, vf, sprite_array),
-                entry(9, vf, sprite_array),
-                entry(10, vf, sprite_array),
-                entry(11, vf, sprite_array),
-                entry(
-                    12,
-                    vf,
-                    wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                ),
-            ],
+            entries: &terrain_entries,
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Horizon terrain layout"),
@@ -4862,7 +4904,7 @@ impl Renderer {
                 });
             }
         }
-        if self.section_copy_bytes >= SECTION_COPY_LIMIT
+        if self.section_copy_bytes >= section_copy_limit()
             && let Some(copies) = self.take_section_copies()
         {
             crate::spans::time("upload_submit", || self.queue.submit([copies]));
@@ -4975,7 +5017,8 @@ impl Renderer {
     /// keeps the terrain in video memory.
     fn compact_arena(&mut self) {
         // Copied per frame: a page empties over a few frames, with no hitch.
-        const BUDGET: u64 = 32 << 20;
+        // Half of it on the small phones (see `section_copy_limit`).
+        let budget: u64 = if low_memory() { 16 << 20 } else { 32 << 20 };
         if self.arena.closing().is_none()
             && let Some(page) = self.arena.sparsest()
         {
@@ -4985,7 +5028,7 @@ impl Renderer {
             return;
         };
         let stride = std::mem::size_of::<TerrainVertex>() as u64;
-        let mut budget = BUDGET;
+        let mut budget = budget;
         let encoder = self.section_copies.get_or_insert_with(|| {
             self.device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -9862,8 +9905,17 @@ mod tests {
             if name == "oit.wgsl" {
                 // The shared maths: it needs the file it is appended to.
                 continue;
+            } else if name == "terrain.wgsl" {
+                // The sprite sampling arms are written for the live array
+                // count (see wgsl_prefix); eight is every arm the file holds.
+                sources.push((
+                    path,
+                    crate::gfx::wgsl_prefix::sprite_terrain(&text, 8),
+                ));
+                continue;
             } else if name == "oit_world.wgsl" {
-                let base = include_str!("terrain.wgsl").to_owned() + include_str!("oit.wgsl");
+                let base = crate::gfx::wgsl_prefix::sprite_terrain(include_str!("terrain.wgsl"), 8)
+                    + include_str!("oit.wgsl");
                 sources.push((path, base + &text));
             } else if name == "oit_features.wgsl" {
                 let base = super::entity_shader() + include_str!("oit.wgsl");

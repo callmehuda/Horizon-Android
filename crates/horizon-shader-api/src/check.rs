@@ -17,6 +17,10 @@ use std::fmt;
 pub const MAX_EXPRESSIONS: usize = 20_000;
 /// Texture reads (samples, gathers and loads) a stage may write.
 pub const MAX_TEXTURE_READS: usize = 64;
+/// Sampled textures one shader stage may bind: GLES's limit per stage
+/// (wgpu-hal's `MAX_TEXTURE_SLOTS`). The phones without Vulkan this pack
+/// format runs on report 16 however many units the driver has.
+pub const MAX_SAMPLED_TEXTURES_PER_STAGE: usize = 16;
 
 /// What is wrong, and where: a file of the pack, with the line and column
 /// when known (0 when not).
@@ -66,6 +70,11 @@ pub struct CheckedStage {
     pub source: String,
     pub expressions: usize,
     pub texture_reads: usize,
+    /// The GLSL ES version the stage needs: 300, 310 or 320, smoothed down
+    /// from 3.2 by trying the writer at 3.0 first (see `translate`); 0 when
+    /// the stage has no entry points. A renderer on a GLES 3.0 device skips a
+    /// stage that needs more with a message saying so.
+    pub es_version: u16,
 }
 
 impl CheckedStage {
@@ -275,7 +284,28 @@ pub fn check_stage(pack: &Pack, kind: StageKind, file: &str) -> Result<CheckedSt
             format!("{texture_reads} texture reads; a stage may write {MAX_TEXTURE_READS}"),
         ));
     }
-    problems.extend(translate(&module, &info, &pack.manifest.options, file));
+    let (translated, es_version) = translate(&module, &info, &pack.manifest.options, file);
+    problems.extend(translated);
+    // GLES binds at most MAX_SAMPLED_TEXTURES_PER_STAGE sampled textures to a
+    // shader stage; over it the renderer's pipeline layout fails validation
+    // with nothing pointing at the pack. The prelude's, the [[textures]] and
+    // the post targets each entry point actually reads count.
+    let bound = sampled_textures_per_stage(&module, &info);
+    for (stage, list) in [("fragment", &bound[0]), ("vertex", &bound[1])] {
+        if list.len() > MAX_SAMPLED_TEXTURES_PER_STAGE {
+            problems.push(problem(
+                file,
+                format!(
+                    "the {stage} stage binds {} sampled textures ({}): GLES allows \
+                     {} per stage — drop reads you can, or merge small textures into an \
+                     atlas or a texture array, or move rare lookups into a buffer",
+                    list.len(),
+                    list.join(", "),
+                    MAX_SAMPLED_TEXTURES_PER_STAGE,
+                ),
+            ));
+        }
+    }
     if !problems.is_empty() {
         return Err(problems);
     }
@@ -288,6 +318,7 @@ pub fn check_stage(pack: &Pack, kind: StageKind, file: &str) -> Result<CheckedSt
         source: own.text,
         expressions,
         texture_reads,
+        es_version,
     })
 }
 
@@ -524,14 +555,21 @@ fn option_sets(options: &[PackOption]) -> [(&'static str, Vec<(String, f64)>); 3
     ]
 }
 
-/// Translates every entry point for Vulkan (SPIR-V), Metal and DirectX 12
-/// (HLSL) with each option set, as wgpu does when it builds the pipelines.
+/// Translates every entry point for Vulkan (SPIR-V), Metal, DirectX 12 (HLSL)
+/// and the GLES backend's GLSL ES writer, with each option set, as wgpu does
+/// when it builds the pipelines. The GLSL ES leg tries the writer at 3.0,
+/// then 3.1, then 3.2, keeping the first that takes the stage: the builtin
+/// overload types the GLSL frontend registers no longer count (naga only
+/// scans what the entry point can reach), so a pack that samples plain 2D
+/// textures lands on 3.0 on a GLES 3.0 phone. Returns the problems, and the
+/// GLSL ES version the stage needs (0 without entry points).
 fn translate(
     module: &naga::Module,
     info: &ModuleInfo,
     options: &[PackOption],
     file: &str,
-) -> Vec<Problem> {
+) -> (Vec<Problem>, u16) {
+    let mut es_needed: u16 = 0;
     let present: HashSet<&str> = module
         .overrides
         .iter()
@@ -563,7 +601,7 @@ fn translate(
                 Ok(p) => p,
                 Err(err) => {
                     problems.push(fail("the override step", err.to_string()));
-                    return problems;
+                    return (problems, es_needed);
                 }
             };
             let spv = naga::back::spv::write_vec(
@@ -596,6 +634,43 @@ fn translate(
                 },
             )
             .write(&m, &i, None);
+            // GLSL ES, as the GLES backend of wgpu runs it: 3.0, then 3.1,
+            // then 3.2, keeping the first that takes the stage.
+            let mut es: u16 = 300;
+            let mut es_error = String::new();
+            while es <= 320 {
+                let written = (|| {
+                    let mut source = String::new();
+                    let options = naga::back::glsl::Options {
+                        version: naga::back::glsl::Version::Embedded {
+                            version: es,
+                            is_webgl: false,
+                        },
+                        ..Default::default()
+                    };
+                    let pipeline = naga::back::glsl::PipelineOptions {
+                        shader_stage: e.stage,
+                        entry_point: e.name.clone(),
+                        multiview: None,
+                    };
+                    let mut writer =
+                        naga::back::glsl::Writer::new(&mut source, &m, &i, &options, &pipeline, Default::default())?;
+                    writer.write()?;
+                    Ok::<(), naga::back::glsl::Error>(())
+                })();
+                match written {
+                    Ok(()) => break,
+                    Err(err) => {
+                        es_error = err.to_string();
+                        es += 10;
+                    }
+                }
+            }
+            if es > 320 {
+                problems.push(fail("GLSL ES 3.0-3.2", es_error));
+            } else {
+                es_needed = es_needed.max(es);
+            }
             let errors = [
                 ("Vulkan (SPIR-V)", spv.err().map(|e| e.to_string())),
                 ("Metal", msl.err().map(|e| e.to_string())),
@@ -610,9 +685,36 @@ fn translate(
                 }
             }
             if !problems.is_empty() {
-                return problems;
+                return (problems, es_needed);
             }
         }
     }
-    problems
+    (problems, es_needed)
+}
+
+/// The sampled textures each shader stage of `module`'s entry points binds:
+/// every prelude, [[textures]] and post-target texture the entry points
+/// actually read, in binding order. Index 0 is fragment, 1 vertex.
+fn sampled_textures_per_stage(module: &naga::Module, info: &ModuleInfo) -> [Vec<String>; 2] {
+    let mut out: [Vec<String>; 2] = [Vec::new(), Vec::new()];
+    for (index, ep) in module.entry_points.iter().enumerate() {
+        let list = match ep.stage {
+            naga::ShaderStage::Fragment => &mut out[0],
+            naga::ShaderStage::Vertex => &mut out[1],
+            _ => continue,
+        };
+        let ep_info = info.get_entry_point(index);
+        for (handle, global) in module.global_variables.iter() {
+            if ep_info[handle].is_empty() {
+                continue;
+            }
+            if let naga::TypeInner::Image { .. } = module.types[global.ty].inner {
+                let name = global.name.clone().unwrap_or_default();
+                if !list.contains(&name) {
+                    list.push(name);
+                }
+            }
+        }
+    }
+    out
 }

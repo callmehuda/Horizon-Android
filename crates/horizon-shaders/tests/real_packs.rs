@@ -357,10 +357,16 @@ fn backends(post: &horizon_shaders::Post) {
                     .map(drop)
                     .map_err(|e| e.to_string())
             }),
-            ("glsl", &|| {
+            ("glsl es 3.0", &|| {
                 use naga::back::glsl;
+                // The GLES backend's writer, at the version the phones without
+                // Vulkan run: every real pack must take ES 3.0, not desktop
+                // GLSL 430.
                 let options = glsl::Options {
-                    version: glsl::Version::Desktop(430),
+                    version: glsl::Version::Embedded {
+                        version: 300,
+                        is_webgl: false,
+                    },
                     ..Default::default()
                 };
                 let pipeline = glsl::PipelineOptions {

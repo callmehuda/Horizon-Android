@@ -850,31 +850,99 @@ pub fn post_target_declarations(manifest: &crate::manifest::Manifest) -> String 
         .collect()
 }
 
+/// The `override <id>` names and top-level `fn <name>` names `text` declares.
+fn declared_names(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            override_ident(line)
+                .or_else(|| fn_ident(line))
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+/// The name an `override <name>` line declares, else `None`.
+fn override_ident(line: &str) -> Option<&str> {
+    let rest = line.trim_start().strip_prefix("override")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let ident_len = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .map(char::len_utf8)
+        .sum::<usize>();
+    (ident_len > 0).then(|| &rest[..ident_len])
+}
+
+/// The name a top-level `fn <name>` line declares, else `None`.
+fn fn_ident(line: &str) -> Option<&str> {
+    let rest = line.trim_start().strip_prefix("fn ")?;
+    let ident_len = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .map(char::len_utf8)
+        .sum::<usize>();
+    (ident_len > 0).then(|| &rest[..ident_len])
+}
+
+/// `text` without the `override` lines and `fn` blocks whose names `declared`
+/// already holds: declaring one again would be a redefinition.
+fn without_redeclarations(text: &str, declared: &[String]) -> String {
+    let mut out = Vec::new();
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        let already = |name: &str| declared.iter().any(|d| d == name);
+        if let Some(id) = override_ident(line) {
+            if already(id) {
+                continue;
+            }
+        }
+        if let Some(name) = fn_ident(line) {
+            if already(name) {
+                // Skip the whole block: through the closing `}` at column 0.
+                while let Some(line) = lines.next() {
+                    if line == "}" {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+        out.push(line);
+    }
+    out.join("\n")
+}
+
 /// The WGSL of the stage `kind` whose own file is `file`: the prelude, the
 /// pack's shared files in order, the file, then the entry points, all of the pack's line.
+/// Appends `text` as the part `name` of `composed`.
+fn push_part(composed: &mut Composed, name: &str, text: &str) {
+    let start = composed.text.len();
+    composed.text += text;
+    if !text.ends_with('\n') {
+        composed.text.push('\n');
+    }
+    composed
+        .parts
+        .push((name.to_owned(), start..composed.text.len()));
+}
+
 pub fn compose(pack: &Pack, kind: StageKind, file: &str) -> Composed {
     let api = pack.manifest.api;
     let mut composed = Composed {
         text: String::new(),
         parts: Vec::new(),
     };
-    let mut push = |name: &str, text: &str| {
-        let start = composed.text.len();
-        composed.text += text;
-        if !text.ends_with('\n') {
-            composed.text.push('\n');
-        }
-        composed
-            .parts
-            .push((name.to_owned(), start..composed.text.len()));
-    };
+
     let mut prelude = kind.prelude(api) + &texture_declarations(&pack.manifest.textures);
     if kind == StageKind::Post {
         prelude += &post_target_declarations(&pack.manifest);
     }
-    push("<prelude>", &prelude);
+    push_part(&mut composed, "<prelude>", &prelude);
     for shared in pack.manifest.shared.iter().filter(|s| *s != file) {
-        push(shared, pack.source(shared).unwrap_or_default());
+        push_part(&mut composed, shared, pack.source(shared).unwrap_or_default());
     }
     // The stage's own extra files, between the shared ones and its file.
     let m = &pack.manifest;
@@ -888,10 +956,10 @@ pub fn compose(pack: &Pack, kind: StageKind, file: &str) -> Composed {
     };
     for extra in stage.into_iter().flat_map(|s| &s.files) {
         if extra != file && !m.shared.contains(extra) {
-            push(extra, pack.source(extra).unwrap_or_default());
+            push_part(&mut composed, extra, pack.source(extra).unwrap_or_default());
         }
     }
-    push(file, pack.source(file).unwrap_or_default());
+    push_part(&mut composed, file, pack.source(file).unwrap_or_default());
     // They draw terrain together: the vertex stage's function is in the material's module.
     if kind == StageKind::Material
         && let Some(vertex) = &m.vertex
@@ -899,17 +967,27 @@ pub fn compose(pack: &Pack, kind: StageKind, file: &str) -> Composed {
         for extra in vertex.files.iter().chain(std::iter::once(&vertex.file)) {
             let own = stage.is_some_and(|s| s.files.contains(extra));
             if !own && !m.shared.contains(extra) {
-                push(extra, pack.source(extra).unwrap_or_default());
+                // The material's own file may have declared the vertex
+                // stage's overrides and helpers already (its helpers link
+                // with the material's): declaring one again would be a
+                // redefinition.
+                let declared = declared_names(&composed.text);
+                let text = without_redeclarations(
+                    pack.source(extra).unwrap_or_default(),
+                    &declared,
+                );
+                push_part(&mut composed, extra, &text);
             }
         }
     }
     if kind == StageKind::Material && m.displacement.is_some() {
-        push(
+        push_part(
+            &mut composed,
             "<entries>",
             &(kind.entries(api).to_owned() + DISPLACEMENT_ENTRIES),
         );
     } else {
-        push("<entries>", kind.entries(api));
+        push_part(&mut composed, "<entries>", kind.entries(api));
     }
     composed
 }

@@ -6,6 +6,82 @@
 /// terrain.wgsl, which the copies are taken from.
 pub const TERRAIN: &str = include_str!("../terrain.wgsl");
 
+/// The sprite sampling arms of terrain.wgsl's `sprite_grad` and `sprite_level`
+/// and of the pack material's `horizon_block_sprite`, for `arrays` texture
+/// arrays: `sprites` holds layers 0..SPRITE_SPLIT, `sprites_1` the next, and
+/// so on. GLES binds at most 16 sampled textures to a stage, and the
+/// terrain's group 0 spends one per array, so only the arrays that hold
+/// layers are declared, sampled and bound: with one array the functions never
+/// so much as mention `sprites_1`, which leaves the layout, the bind group
+/// and the shader agreeing on the live count.
+fn sprite_arms(call: &str, tail: &str, arrays: u32) -> String {
+    let sample = |name: &str| {
+        format!("        return {call}({name}, sprite_sampler, uv, l{tail});\n")
+    };
+    let array = |i: u32, out: &mut String| {
+        if i == 0 {
+            out.push_str("sprites");
+        } else {
+            out.push_str(&format!("sprites_{i}"));
+        }
+    };
+    if arrays <= 1 {
+        return format!("    return {call}(sprites, sprite_sampler, uv, l{tail});\n");
+    }
+    let mut out = String::from("    switch layer / SPRITE_SPLIT {\n");
+    for i in 0..arrays - 1 {
+        let mut name = String::new();
+        array(i, &mut name);
+        out += &format!("        case {i}u: {{\n{}        }}\n", sample(&name));
+    }
+    let mut last = String::new();
+    array(arrays - 1, &mut last);
+    out += &format!(
+        "        default: {{\n{}        }}\n    }}\n",
+        sample(&last)
+    );
+    out
+}
+
+/// The pack material's `horizon_block_sprite` switch (native_material's
+/// entries), for `arrays` arrays: as `sprite_terrain`, only the arrays that
+/// hold layers are sampled.
+pub fn native_sprite_arms(arrays: u32) -> String {
+    let sample = |name: &str| {
+        format!("        return textureSampleLevel({name}, s, uv, l, lod);\n")
+    };
+    let array = |i: u32, out: &mut String| {
+        if i == 0 {
+            out.push_str("horizon_terrain_sprites");
+        } else {
+            out.push_str(&format!("horizon_terrain_sprites_{i}"));
+        }
+    };
+    if arrays <= 1 {
+        return format!("    return textureSampleLevel(horizon_terrain_sprites, s, uv, l, lod);\n");
+    }
+    let mut out = String::from("    switch idx / horizon_terrain_SPRITE_SPLIT {\n");
+    for i in 0..arrays - 1 {
+        let mut name = String::new();
+        array(i, &mut name);
+        out += &format!("        case {i}u: {{\n{}        }}\n", sample(&name));
+    }
+    let mut last = String::new();
+    array(arrays - 1, &mut last);
+    out += &format!(
+        "        default: {{\n{}        }}\n    }}\n",
+        sample(&last)
+    );
+    out
+}
+
+/// terrain.wgsl with its sprite sampling arms written for `arrays` arrays.
+pub fn sprite_terrain(source: &str, arrays: u32) -> String {
+    source
+        .replace("HZ_SPRITE_GRAD_ARMS", &sprite_arms("textureSampleGrad", ", dx, dy", arrays))
+        .replace("HZ_SPRITE_LEVEL_ARMS", &sprite_arms("textureSampleLevel", ", lod", arrays))
+}
+
 /// The text of `source` from the line starting with `start` up to (not including) the one
 /// starting with `end`.
 pub fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {

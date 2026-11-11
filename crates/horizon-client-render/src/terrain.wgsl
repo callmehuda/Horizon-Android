@@ -63,36 +63,12 @@ override TERRAIN_FULLY_VISIBLE: bool = false;
 // A sprite sampled with the given gradients, from whichever array holds its layer.
 fn sprite_grad(uv: vec2<f32>, layer: u32, dx: vec2<f32>, dy: vec2<f32>) -> vec4<f32> {
     let l = i32(layer % SPRITE_SPLIT);
-    if SPRITE_ARRAYS == 1u {
-        return textureSampleGrad(sprites, sprite_sampler, uv, l, dx, dy);
-    }
-    switch layer / SPRITE_SPLIT {
-        case 0u: { return textureSampleGrad(sprites, sprite_sampler, uv, l, dx, dy); }
-        case 1u: { return textureSampleGrad(sprites_1, sprite_sampler, uv, l, dx, dy); }
-        case 2u: { return textureSampleGrad(sprites_2, sprite_sampler, uv, l, dx, dy); }
-        case 3u: { return textureSampleGrad(sprites_3, sprite_sampler, uv, l, dx, dy); }
-        case 4u: { return textureSampleGrad(sprites_4, sprite_sampler, uv, l, dx, dy); }
-        case 5u: { return textureSampleGrad(sprites_5, sprite_sampler, uv, l, dx, dy); }
-        case 6u: { return textureSampleGrad(sprites_6, sprite_sampler, uv, l, dx, dy); }
-        default: { return textureSampleGrad(sprites_7, sprite_sampler, uv, l, dx, dy); }
-    }
+    HZ_SPRITE_GRAD_ARMS
 }
 // The same at an explicit mip level.
 fn sprite_level(uv: vec2<f32>, layer: u32, lod: f32) -> vec4<f32> {
     let l = i32(layer % SPRITE_SPLIT);
-    if SPRITE_ARRAYS == 1u {
-        return textureSampleLevel(sprites, sprite_sampler, uv, l, lod);
-    }
-    switch layer / SPRITE_SPLIT {
-        case 0u: { return textureSampleLevel(sprites, sprite_sampler, uv, l, lod); }
-        case 1u: { return textureSampleLevel(sprites_1, sprite_sampler, uv, l, lod); }
-        case 2u: { return textureSampleLevel(sprites_2, sprite_sampler, uv, l, lod); }
-        case 3u: { return textureSampleLevel(sprites_3, sprite_sampler, uv, l, lod); }
-        case 4u: { return textureSampleLevel(sprites_4, sprite_sampler, uv, l, lod); }
-        case 5u: { return textureSampleLevel(sprites_5, sprite_sampler, uv, l, lod); }
-        case 6u: { return textureSampleLevel(sprites_6, sprite_sampler, uv, l, lod); }
-        default: { return textureSampleLevel(sprites_7, sprite_sampler, uv, l, lod); }
-    }
+    HZ_SPRITE_LEVEL_ARMS
 }
 // texture_sampling.glsl's sampleNearest: the sprite's texels stay square pixels, blending only
 // across the one screen pixel where two meet, so a linear (and anisotropic) sampler keeps them crisp.

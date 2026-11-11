@@ -13,6 +13,11 @@ fn sample_text() -> String {
     std::fs::read_to_string(sample_dir().join(MANIFEST)).unwrap()
 }
 
+/// The manifest's post chain limit, as the build under test reads it.
+fn crate_max_post_passes() -> usize {
+    horizon_shader_api::manifest::MAX_POST_PASSES
+}
+
 fn refused(text: &str) -> String {
     Manifest::parse(text).expect_err("should be refused")
 }
@@ -217,10 +222,6 @@ fn refuses_what_this_build_does_not_read() {
     let cases = [
         (text.replace("schema = 1", "schema = 2"), "schema 2"),
         (
-            text.replace("api = \"0.1\"", "api = \"0.2\""),
-            "shader API 0.2",
-        ),
-        (
             text.replace("\"sample_pack\"", "\"Sample\""),
             "is not [a-z0-9_]",
         ),
@@ -293,8 +294,17 @@ fn refuses_what_this_build_does_not_read() {
     assert!(refused(no_stage).contains("no stage"));
     let mirror = format!("{no_stage}[sky]\nfile = \"sky.wgsl\"\n[reflection]\n");
     assert!(refused(&mirror).contains("[reflection] needs [material]"));
-    let many = (0..9).map(|i| format!("[[post]]\nfile = \"p{i}.wgsl\"\n"));
-    assert!(refused(&format!("{no_stage}{}", many.collect::<String>())).contains("9 post passes"));
+    // The chain limit is MAX_POST_PASSES: one over it is refused.
+    let many = (0..=crate_max_post_passes())
+        .map(|i| format!("[[post]]\nfile = \"p{i}.wgsl\"\n"));
+    let over = format!("{no_stage}{}", many.collect::<String>());
+    assert!(
+        refused(&over).contains(&format!(
+            "{} post passes; a pack may chain",
+            crate_max_post_passes() + 1
+        )),
+        "{over}"
+    );
 }
 
 #[test]

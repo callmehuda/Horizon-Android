@@ -189,10 +189,14 @@ impl Oit {
             }),
         ];
         let buffers = &buffers[..];
+        // The OIT passes sample the terrain's sprites: as the material's, only
+        // the arrays that hold layers (the layout, the bind group and the
+        // shader agree on the live count).
+        let arrays = sprites[0] as u32;
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Horizon improved transparency"),
             source: wgpu::ShaderSource::Wgsl(
-                (include_str!("../terrain.wgsl").to_owned()
+                (super::wgsl_prefix::sprite_terrain(include_str!("../terrain.wgsl"), arrays)
                     + include_str!("../oit.wgsl")
                     + include_str!("../oit_world.wgsl"))
                 .into(),
@@ -900,7 +904,7 @@ mod tests {
     #[test]
     fn the_terrain_shader_validates() {
         validate(
-            &(include_str!("../terrain.wgsl").to_owned()
+            &(crate::gfx::wgsl_prefix::sprite_terrain(include_str!("../terrain.wgsl"), 8)
                 + include_str!("../oit.wgsl")
                 + include_str!("../oit_world.wgsl")),
             &[

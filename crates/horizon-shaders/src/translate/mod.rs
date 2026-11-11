@@ -1443,8 +1443,10 @@ fn compile(stage: &Stage, text: &str, header_lines: usize) -> Result<naga::Modul
 /// every handle and emitted range stays as it was.
 fn lengths_of_loaded_arrays(module: &mut naga::Module) {
     use naga::Expression as E;
+    let mut changed = false;
     let functions = module.functions.iter_mut().map(|(_, f)| f);
     for f in functions.chain(module.entry_points.iter_mut().map(|e| &mut e.function)) {
+        let mut changed_here = false;
         let loads: Vec<_> = f
             .expressions
             .iter()
@@ -1463,7 +1465,43 @@ fn lengths_of_loaded_arrays(module: &mut naga::Module) {
                 kind: naga::ScalarKind::Uint,
                 convert: Some(4),
             };
+            changed_here = true;
         }
+
+        // `block.member.length()` lowers to loading the block and taking the
+        // member of the loaded value. A block holding a runtime-sized array
+        // cannot be loaded at all, so the member has to come off the block's
+        // pointer: the load's slot becomes a copy of its pointer, which
+        // leaves the member access, and the length of it, on pointers.
+        let members: Vec<_> = f
+            .expressions
+            .iter()
+            .filter_map(|(_, e)| match *e {
+                E::ArrayLength(access) => match f.expressions[access] {
+                    E::AccessIndex { base: load, index } => match f.expressions[load] {
+                        E::Load { pointer } => Some((load, access, pointer, index)),
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        for (load, access, pointer, index) in members {
+            // The member comes off the block's pointer, not off a load of the
+            // block. The load's slot is left holding a literal, dead but
+            // valid; the compaction below drops it.
+            f.expressions[load] = E::Literal(naga::Literal::I32(0));
+            f.expressions[access] = E::AccessIndex { base: pointer, index };
+            changed_here = true;
+        }
+        changed |= changed_here;
+    }
+    if changed {
+        // The rewrites leave dead expressions whose stale introduction would
+        // fail the validator's scope bookkeeping; compaction drops them and
+        // rebuilds the emit ranges.
+        naga::compact::compact(module, naga::compact::KeepUnused::No);
     }
 }
 

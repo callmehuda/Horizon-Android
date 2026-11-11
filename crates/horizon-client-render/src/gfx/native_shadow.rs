@@ -410,14 +410,18 @@ fn shadow_solid(materials: &[(u32, u32)], solid: &[u32]) -> String {
 
 /// The shadow pass's shader: the frame, Horizon's terrain, and the entries, with the layers
 /// `solid` of `shadow_solid`.
-fn shader_source(solid: &str) -> String {
+fn shader_source(solid: &str, arrays: u32) -> String {
     format!(
         "{}@group({GROUP}) @binding(0) var<uniform> frame: Frame;\n{}\
          // Horizon's terrain (terrain.wgsl)\n{}{solid}{ENTRIES}",
         FrameInputs::WGSL.wgsl(),
         horizon_shader_api::stages::SHADOW_HELPERS,
         prefixed(
-            section(TERRAIN, "struct Globals {", "// Sky (SkyRenderer)"),
+            section(
+                &super::wgsl_prefix::sprite_terrain(TERRAIN, arrays),
+                "struct Globals {",
+                "// Sky (SkyRenderer)",
+            ),
             PREFIX
         )
     )
@@ -430,7 +434,11 @@ impl NativeShadow {
         frame: &super::native_post::NativeFrame,
         solid_materials: &[u32],
     ) -> Result<Self, String> {
-        let text = shader_source(&shadow_solid(shape.sprite_materials, solid_materials));
+        // The shadow samples the terrain's sprites: as the material's, only
+        // the arrays that hold layers (the layout, the bind group and the
+        // shader agree on the live count).
+        let arrays = shape.sprites[0] as u32;
+        let text = shader_source(&shadow_solid(shape.sprite_materials, solid_materials), arrays);
         let module = naga::front::wgsl::parse_str(&text)
             .map_err(|e| format!("shadow pass: {}", e.emit_to_string(&text)))?;
         let constants = [
@@ -588,7 +596,7 @@ mod tests {
     #[test]
     fn the_shadow_shader_validates() {
         for materials in [&[][..], &[(3, 7), (4, 8), (9, 7)][..]] {
-            let text = shader_source(&shadow_solid(materials, &[7]));
+            let text = shader_source(&shadow_solid(materials, &[7]), 8);
             let module = naga::front::wgsl::parse_str(&text).unwrap();
             naga::valid::Validator::new(
                 naga::valid::ValidationFlags::all(),

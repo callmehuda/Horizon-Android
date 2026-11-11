@@ -41,9 +41,8 @@ struct TaaUniform {
     jitter: [f32; 4],
 }
 
-/// TAA's GPU resources, absent when the device cannot compile the shader
-/// (the OpenGL backend's naga GLSL emitter does not support `textureLoad`
-/// from depth textures).
+/// TAA's GPU resources, absent when the device cannot compile the shader:
+/// probed behind an error scope, with a fallback to running without TAA.
 struct TaaResources {
     layout: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
@@ -146,9 +145,11 @@ impl Post {
                 cache: None,
             })
         };
-        // The OpenGL backend's GLSL translator does not support textureLoad
-        // from depth textures: on devices running through OpenGL (such as older
-        // Intel GPUs on Linux), TAA cannot compile its pipeline.
+        // Depth textures become shadow samplers only where a stage really
+        // samples them for comparison, so `textureLoad` from one (TAA reads
+        // the world's depth to clamp its neighbourhood) compiles as the plain
+        // `sampler2D` + `texelFetch` GLSL ES 3.0 carries; where a driver
+        // still refuses it, this probe keeps the game running without TAA.
         let taa_resources = {
             let taa_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Horizon TAA bindings"),

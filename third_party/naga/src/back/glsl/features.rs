@@ -1,6 +1,7 @@
 use core::fmt::Write;
 
 use super::{BackendResult, Error, Version, Writer};
+use alloc::vec::Vec;
 use crate::{
     back::glsl::{Options, WriterFlags},
     AddressSpace, Binding, Expression, Handle, ImageClass, ImageDimension, Interpolation,
@@ -317,6 +318,83 @@ impl FeaturesManager {
 }
 
 impl<W> Writer<'_, W> {
+    /// The types and functions this entry point can reach.
+    ///
+    /// The GLSL frontend registers the parameter types of every builtin
+    /// overload it generates, so the module's type arena holds types no
+    /// reachable code uses: calling `texture` at all leaves a cube array
+    /// image behind, which would otherwise demand `samplerCubeArray`
+    /// (GLSL ES 3.2 on a GLES 3.0 phone) from a pack that only samples
+    /// plain 2D textures. Scanning the whole arena also counts dead
+    /// functions' expressions, asking for features the entry point never
+    /// uses. Only what this entry point can reach counts, both for types
+    /// and for the functions whose expressions are scanned for features.
+    fn reachable_sets(
+        &self,
+    ) -> (
+        crate::arena::HandleSet<crate::Type>,
+        Vec<Handle<crate::Function>>,
+    ) {
+        let ep_info = self.info.get_entry_point(self.entry_point_idx as usize);
+
+        let mut types = crate::arena::HandleSet::for_arena(&self.module.types);
+        let mut type_stack: Vec<Handle<crate::Type>> = Vec::new();
+
+        // The entry point's own IO.
+        for arg in self.entry_point.function.arguments.iter() {
+            push_type(arg.ty, &mut types, &mut type_stack);
+        }
+        if let Some(result) = &self.entry_point.function.result {
+            push_type(result.ty, &mut types, &mut type_stack);
+        }
+
+        // The globals this entry point uses, with their initializers.
+        for (handle, global) in self.module.global_variables.iter() {
+            if ep_info[handle].is_empty() {
+                continue;
+            }
+            push_type(global.ty, &mut types, &mut type_stack);
+            if let Some(init) = global.init {
+                if let crate::Expression::Constant(constant) = self.module.global_expressions[init]
+                {
+                    push_type(self.module.constants[constant].ty, &mut types, &mut type_stack);
+                }
+            }
+        }
+
+        // The entry point's callees, transitively: their parameters, locals
+        // and the types their expressions name.
+        let mut callees: Vec<Handle<crate::Function>> = Vec::new();
+        let mut seen = crate::arena::HandleSet::for_arena(&self.module.functions);
+        walk_function(&self.entry_point.function, self.module, &mut types, &mut type_stack);
+        collect_calls(&self.entry_point.function.body, &mut callees, &mut seen);
+        let mut functions = Vec::new();
+        while let Some(fh) = callees.pop() {
+            functions.push(fh);
+            let f = &self.module.functions[fh];
+            walk_function(f, self.module, &mut types, &mut type_stack);
+            collect_calls(&f.body, &mut callees, &mut seen);
+        }
+
+        // Everything those types contain.
+        while let Some(ty) = type_stack.pop() {
+            match self.module.types[ty].inner {
+                crate::TypeInner::Struct { ref members, .. } => {
+                    for member in members {
+                        push_type(member.ty, &mut types, &mut type_stack);
+                    }
+                }
+                crate::TypeInner::Array { base, .. }
+                | crate::TypeInner::Pointer { base, .. } => {
+                    push_type(base, &mut types, &mut type_stack);
+                }
+                _ => {}
+            }
+        }
+
+        (types, functions)
+    }
+
     /// Helper method that searches the module for all the needed [`Features`]
     ///
     /// # Errors
@@ -353,7 +431,16 @@ impl<W> Writer<'_, W> {
             self.features.request(Features::MULTI_VIEW);
         }
 
-        for (ty_handle, ty) in self.module.types.iter() {
+        // Only the types this entry point can reach count: the GLSL frontend
+        // registers the parameter types of every builtin overload it
+        // generates, so the arena holds types no reachable code uses (a cube
+        // array image for `samplerCubeArray`, say), which would demand
+        // `CUBE_TEXTURES_ARRAY` (GLSL ES 3.2) from a pack that only samples
+        // plain 2D textures.
+        let (reachable_types, reachable_functions) = self.reachable_sets();
+
+        for ty_handle in reachable_types.iter() {
+            let ty = &self.module.types[ty_handle];
             match ty.inner {
                 TypeInner::Scalar(scalar)
                 | TypeInner::Vector { scalar, .. }
@@ -497,12 +584,11 @@ impl<W> Writer<'_, W> {
             ..
         } = self;
 
-        // Loop through all expressions in both functions and the entry point
+        // Loop through all expressions in the entry point and its callees
         // to check for needed features
-        for (expressions, info) in module
-            .functions
+        for (expressions, info) in reachable_functions
             .iter()
-            .map(|(h, f)| (&f.expressions, &info[h]))
+            .map(|&h| (&module.functions[h].expressions, &info[h]))
             .chain(core::iter::once((
                 &entry_point.function.expressions,
                 info.get_entry_point(entry_point_idx as usize),
@@ -596,10 +682,9 @@ impl<W> Writer<'_, W> {
             }
         }
 
-        for blocks in module
-            .functions
+        for blocks in reachable_functions
             .iter()
-            .map(|(_, f)| &f.body)
+            .map(|&h| &module.functions[h].body)
             .chain(core::iter::once(&entry_point.function.body))
         {
             for (stmt, _) in blocks.span_iter() {
@@ -665,6 +750,89 @@ impl<W> Writer<'_, W> {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Add `ty` to the reachable set, and to the stack waiting to be opened, if
+/// it is new.
+fn push_type(
+    ty: Handle<crate::Type>,
+    types: &mut crate::arena::HandleSet<crate::Type>,
+    stack: &mut Vec<Handle<crate::Type>>,
+) {
+    if types.insert(ty) {
+        stack.push(ty);
+    }
+}
+
+/// Add the types a function names: its parameters, its locals and their
+/// initializers, and the types its expressions carry.
+fn walk_function(
+    f: &crate::Function,
+    module: &crate::Module,
+    types: &mut crate::arena::HandleSet<crate::Type>,
+    stack: &mut Vec<Handle<crate::Type>>,
+) {
+    for arg in f.arguments.iter() {
+        push_type(arg.ty, types, stack);
+    }
+    for (_, local) in f.local_variables.iter() {
+        push_type(local.ty, types, stack);
+        if let Some(init) = local.init {
+            if let crate::Expression::Constant(constant) = f.expressions[init] {
+                push_type(module.constants[constant].ty, types, stack);
+            }
+        }
+    }
+    for (_, expr) in f.expressions.iter() {
+        match *expr {
+            crate::Expression::Compose { ty, .. } => push_type(ty, types, stack),
+            crate::Expression::Constant(constant) => {
+                push_type(module.constants[constant].ty, types, stack)
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Add the functions `statements` (and their nested blocks) call to
+/// `callees`, once each.
+fn collect_calls(
+    statements: &[crate::Statement],
+    callees: &mut Vec<Handle<crate::Function>>,
+    seen: &mut crate::arena::HandleSet<crate::Function>,
+) {
+    for statement in statements {
+        match *statement {
+            crate::Statement::Call { function, .. } => {
+                if seen.insert(function) {
+                    callees.push(function);
+                }
+            }
+            crate::Statement::Block(ref block) => collect_calls(block, callees, seen),
+            crate::Statement::If {
+                ref accept,
+                ref reject,
+                ..
+            } => {
+                collect_calls(accept, callees, seen);
+                collect_calls(reject, callees, seen);
+            }
+            crate::Statement::Loop {
+                ref body,
+                ref continuing,
+                ..
+            } => {
+                collect_calls(body, callees, seen);
+                collect_calls(continuing, callees, seen);
+            }
+            crate::Statement::Switch { ref cases, .. } => {
+                for case in cases {
+                    collect_calls(&case.body, callees, seen);
+                }
+            }
+            _ => {}
         }
     }
 }

@@ -16,6 +16,7 @@ bindings and no entry points, and no names starting with `horizon_`.
 | material | `[material]` | `fn material(input: MaterialInput) -> Surface` |
 | weather | `[weather]` | `fn weather(input: WeatherInput) -> vec4<f32>` |
 | post | `[[post]]` | `fn post(input: PostInput) -> vec4<f32>` |
+| tonemap | `[tonemap]` | `fn tonemap(input: TonemapInput) -> vec3<f32>` |
 
 ## sky
 
@@ -53,9 +54,6 @@ One corner of a block's surface, for `fn vertex(input: VertexInput) -> vec3<f32>
 | `tint` | `vec4<f32>` | The vertex colour (biome tint, face shade, ambient occlusion); alpha 1. |
 | `face` | `u32` | For a fluid, the face of the block the corner is on (as `MaterialInput.face`), else 0. |
 | `fluid` | `u32` | 1 on a fluid's surface (water or lava), else 0. |
-| `block_position` | `vec3<f32>` | The corner inside its 16×16×16 section, 0..16, before the section's offset is added. |
-| `tags` | `u32` | The pack's sprite tags this quad's sprite has: bit i for the manifest's i-th `[[tags]]`. |
-| `emission` | `f32` | How strongly the block itself shines, 0..1, by its kind of light; 0 for most blocks. |
 
 Resources (bind group 3):
 
@@ -89,7 +87,7 @@ One point of a block's surface, for `fn material(input: MaterialInput) -> Surfac
 | `normal` | `vec3<f32>` | The surface's geometric normal, a unit vector in world axes, facing the camera. A normal within about 3.6 degrees of an axis is that axis exactly, so distant block faces do not shimmer; flowing water's slopes are steeper and keep theirs. |
 | `tangent` | `vec4<f32>` | The surface's tangent: xyz the unit direction in world axes along which `uv.x` grows, w the sign (1 or -1) that makes `cross(normal, tangent.xyz) * tangent.w` the direction `uv.y` grows along (down the texture). With `normal` it turns a normal map's normals into world axes. |
 | `colored_light` | `vec3<f32>` | The frame's coloured lights at this point (`[[particle_lights]]`, held and dropped items in their `[[lights]]` colour while dynamic lights are on, and mods' visual lights), 0..1, to light the surface with as the pack likes; 0 where none reaches. |
-| `displaced` | `f32` | How much of the surface's relief came from `[displacement]`, 0..1 (0 without `[displacement]`). |
+| `displaced` | `f32` | How much of the relief `[displacement]` gave this point as geometry, 0..1: 1 near the camera, where the surface already lies where `displacement` put it (`position` is that point; a parallax effect would count its depth twice), easing to 0 at `[displacement] distance`; always 0 without `[displacement]`. |
 
 ### `Surface`
 
@@ -183,7 +181,7 @@ Resources (bind group 3):
 | 8 | `var history: texture_2d<f32>` | Last frame's input to the last pass (what the pass before it wrote), for temporal passes (TAA, denoising): put such a pass second to last and it reads its own previous output; reproject with `frame.previous_view_projection`. Black on the first frame, after a gap of over half a second, and with a single pass. |
 | 9 | `var shadow_map_translucent: texture_depth_2d` | `shadow_map` with the translucent terrain (water, stained glass, ice) the light passes through drawn in too, read with `shadow_sampler` the same way: a point lit in `shadow_map` but not here lies under such a surface, which `shadow_color` gives the colour of. |
 | 10 | `var shadow_color: texture_2d<f32>` | The texture colour times the vertex colour (rgb: the tint, the face's directional shade and ambient occlusion) of the nearest translucent surface the light passes through at each texel of `shadow_map_translucent`, white where there is none; alpha is 1 on a fluid (water) and the texture's alpha, at most 0.99, on anything else. Read it with `textureLoad` at `shadow_position`'s xy times `textureDimensions(shadow_color)`. |
-| 11 | `var scene_surface: texture_2d<u32>` | What the material stage's `set_surface` stored for the solid terrain at each pixel, unfiltered (`textureLoad`): read it through the prelude's `surface_at`, which knows its layout and where it no longer shows. Blank without a material stage that calls `set_surface`. |
+| 11 | `var scene_surface: texture_2d<u32>` | What the material stage's `set_surface` stored for the solid terrain at each pixel, unfiltered (`textureLoad`; its texels are the bits of floats, so `bitcast<vec4<f32>>` them): read it through the prelude's `surface_at`, which knows its layout and where it no longer shows. Blank without a material stage that calls `set_surface`. |
 
 Helpers:
 
@@ -198,6 +196,35 @@ A `[[post]]` entry with `output = "<name>"` writes a target of the pack's own, a
 world's size (1, 0.5 or 0.25), instead of the next pass's `previous`; the prelude of every pass declares
 `var <name>: texture_2d<f32>` (group 3 from binding 32), which holds last frame's until written again (a
 pass reads a blank one in place of the target it writes).
+
+## tonemap
+
+`fn tonemap(input: TonemapInput) -> vec3<f32>`
+
+### `TonemapInput`
+
+One pixel of an output (the window), for `fn tonemap(input: TonemapInput) -> vec3<f32>`, which returns its colour for the output `frame` describes: linear light, 1.0 at paper white, from 0 to `frame.headroom` (Horizon clamps it there).
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `uv` | `vec2<f32>` | Where the pixel is, 0..1 from the top left. |
+| `pixel` | `vec2<f32>` | The pixel's centre, in pixels from the top left of the output (the window). |
+| `color` | `vec3<f32>` | The post chain's picture here (the world's without one), linear light, never negative or NaN. |
+
+Resources (bind group 3):
+
+| Binding | Declaration | Meaning |
+| --- | --- | --- |
+| 0 | `var<uniform> frame: Frame` | The frame (`Frame`). |
+| 3 | `var previous: texture_2d<f32>` | The post chain's picture at the window's size (without a post chain, the world's at the world's size), linear light: what `input.color` samples, for a curve that reads around the pixel. |
+| 4 | `var linear_sampler: sampler` | Bilinear filtering, clamped to the edges. |
+| 5 | `var nearest_sampler: sampler` | Nearest texel, clamped to the edges. |
+
+Helpers:
+
+- `fn shadow_position(position: vec3<f32>) -> vec3<f32>`: where the camera-relative point `position` is
+  stored in the shadow map, for `textureSampleCompareLevel`.
+- `fn shadow_distort(xy: vec2<f32>) -> vec2<f32>`: the map's distortion of a point at shadow clip `xy`.
 
 ## The frame
 
@@ -256,6 +283,11 @@ The frame, as `frame` in every stage. Positions and directions are in world axes
 | `shadow_distortion` | `f32` | 740 | How strongly the shadow map is distorted toward its centre, 0..1: a point at shadow clip `xy` is stored at `xy / (length(xy) * k + 1 - k)`, so texels near the camera cover less ground (`shadow_position` applies it). |
 | `shadow_resolution` | `f32` | 744 | The shadow map's side, in texels; 0 without a shadow map. |
 | `shadow_center_texel` | `f32` | 748 | The ground one shadow texel covers at the map's centre, in blocks (for a bias that scales with it); 0 without a shadow map. |
+| `hdr` | `u32` | 752 | 1 while the output is HDR, else 0. |
+| `headroom` | `f32` | 756 | The peak over paper white: the brightest value the display shows (Apple's EDR headroom, Android's HDR/SDR ratio). 1 in SDR. It changes while the game runs (the system's SDR white, a calibration, another display), so read it every frame. |
+| `paper_white` | `f32` | 760 | Paper white in nits; a nominal 80 in SDR. |
+| `peak` | `f32` | 764 | The peak brightness in nits; a nominal 80 in SDR, as `paper_white`. |
+| `black_level` | `f32` | 768 | The display's black in nits (HDR's Black Level); 0 in SDR. |
 
 ## Options
 
@@ -270,7 +302,7 @@ Each `[[options]]` entry sets the WGSL `override` of the same name when the pipe
 
 ## Limits
 
-- 8 post passes, 64 options, `budget.gpu_ms` up to 16.
+- 12 post passes, 64 options, `budget.gpu_ms` up to 16.
 - 256 KiB per WGSL file, 8 MiB per pack.
 - Per stage: 20000 naga expressions over all its functions, 64 texture reads (samples,
   gathers and loads, the prelude's included).

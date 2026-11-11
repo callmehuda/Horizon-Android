@@ -1,0 +1,148 @@
+name: Android release
+run-name: Android release · ${{ github.ref_name }}
+
+# A tag (v*) builds the signed public release APKs with the repository's own
+# tools (tools/android_release.py: one fixed commit, provenance checks, every
+# ABI's APK with a SHA256SUMS) and publishes them as a GitHub Release.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      all_abis:
+        description: Also build ARMv7, x86 and x86_64
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: ${{ fromJSON(inputs.all_abis && '["arm64-v8a","armeabi-v7a","x86","x86_64"]' || '["arm64-v8a"]') }}
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      HORIZON_TELEMETRY_URL: 'off'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false
+      - name: Restore the release signing identity
+        env:
+          RELEASE_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          python3 - <<'PY'
+          import base64, os
+          from pathlib import Path
+          # A release build only ever signs with the release key: a dev key
+          # would update over stable installs and never the other way.
+          value = os.environ.get('RELEASE_KEYSTORE', '')
+          if not value:
+              raise SystemExit('Set ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD and ANDROID_KEY_ALIAS; see docs/android-dev-builds.md')
+          path = Path('.local/android/ci.keystore')
+          path.parent.mkdir(parents=True, exist_ok=True)
+          path.write_bytes(base64.b64decode(value, validate=True))
+          path.chmod(0o600)
+          password = os.environ['RELEASE_KEYSTORE_PASSWORD']
+          alias = os.environ['RELEASE_KEY_ALIAS']
+          # Gradle resolves a relative storeFile against packaging/android, so
+          # pass an absolute path and the credentials that belong to it.
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
+              env.write(f'HORIZON_ANDROID_KEYSTORE={path.resolve()}\n')
+              env.write(f'HORIZON_ANDROID_KEYSTORE_PASSWORD={password}\n')
+              env.write(f'HORIZON_ANDROID_KEY_ALIAS={alias}\n')
+              env.write(f'HORIZON_ANDROID_KEY_PASSWORD={password}\n')
+          PY
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
+        with:
+          gradle-version: '8.14'
+      - name: Install Android toolchain
+        env:
+          ABI: ${{ matrix.abi }}
+        run: |
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [[ ! -x "$sdkmanager" ]]; then
+            sdkmanager=$(find "$ANDROID_HOME/cmdline-tools" -type f -path '*/bin/sdkmanager' | sort -V | tail -n 1)
+          fi
+          test -x "$sdkmanager"
+          "$sdkmanager" --sdk_root="$ANDROID_HOME" 'platforms;android-35' 'build-tools;35.0.0' 'ndk;28.2.13676358'
+          rustup show
+          case "$ABI" in
+            arm64-v8a) target=aarch64-linux-android ;;
+            armeabi-v7a) target=armv7-linux-androideabi ;;
+            x86) target=i686-linux-android ;;
+            x86_64) target=x86_64-linux-android ;;
+          esac
+          rustup target add "$target"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .local/android/release-arm64
+            .local/android/release-armv7
+            .local/android/release-x86
+            .local/android/release-x86_64
+          key: android-release-${{ runner.os }}-${{ matrix.abi }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'packaging/android/build.gradle') }}-${{ github.sha }}
+          restore-keys: |
+            android-release-${{ runner.os }}-${{ matrix.abi }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'packaging/android/build.gradle') }}-
+      - name: Check public source and packaging boundaries
+        run: |
+          python3 tools/check_public_tree.py
+          python3 -m unittest discover -s tests -p 'test_android_release_audit.py'
+      - name: Prepare private engine inputs from official downloads
+        run: python3 tools/android_prepare.py --java-home "$JAVA_HOME"
+      - name: Build the signed release APK
+        env:
+          ABI: ${{ matrix.abi }}
+        run: |
+          # tools/android_release.py drives tools/android_build.py itself
+          # (one fixed commit, provenance checks, per-ABI release caches).
+          python3 tools/android_release.py --abi "$ABI" --jobs "$CARGO_BUILD_JOBS"
+      - name: Publish the GitHub release
+        env:
+          ABI: ${{ matrix.abi }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(python3 - <<'PY'
+          import re
+          from pathlib import Path
+          print(re.search(r"versionName '([^']+)'", Path('packaging/android/build.gradle').read_text()).group(1))
+          PY
+          )
+          dir=".local/android/releases/$version"
+          tag="${GITHUB_REF_NAME}"
+          # The first ABI to finish creates the release; the others add to it,
+          # so every ABI's APK lands under the one tag.
+          args=(--draft --title "Horizon $version" --notes-file -)
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            git tag -n99 --format='%(contents)' "$tag" 2>/dev/null | gh release create "$tag" "$dir"/* "${args[@]}" --repo "$GITHUB_REPOSITORY" || \
+              git log -1 --format='%B' | gh release create "$tag" "$dir"/* "${args[@]}" --repo "$GITHUB_REPOSITORY"
+          else
+            git tag -n99 --format='%(contents)' "$tag" 2>/dev/null | gh release upload "$tag" "$dir"/* --clobber --repo "$GITHUB_REPOSITORY" || \
+              gh release upload "$tag" "$dir"/* --clobber --repo "$GITHUB_REPOSITORY"
+          fi
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name'
+          cat <<SUMMARY >> "$GITHUB_STEP_SUMMARY"
+          ### Horizon $version · ${{ matrix.abi }}
+
+          Commit: \`${{ github.sha }}\`. Signed public release APKs with
+          SHA256SUMS under the tag's release; attachments are added per ABI as
+          each build finishes.
+          SUMMARY

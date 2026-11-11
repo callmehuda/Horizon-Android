@@ -564,10 +564,16 @@ mod tests {
         assert!(c.notes.is_empty(), "{:?}", c.notes);
         let names: Vec<_> = c.uniforms().map(|u| u.0).collect();
         assert_eq!(names, ["b", "c", "d", "e", "f", "g", "h", "i", "j"]);
+        // The player stands in the desert: its pack id, so `in(biome, ...,
+        // BIOME_DESERT)` reads true.
+        let biome_desert = f64::from(crate::biomes::pack_id(
+            "minecraft:desert",
+            ["minecraft:beach", "minecraft:desert"],
+        ));
         let builtin = |n: &str| match n {
             "cameraPosition" => Some(Val::vector(&[1.0, 64.0, 2.0])),
             "sunAngle" => Some(Val::scalar(0.125)),
-            "biome" => Some(Val::scalar(1.0)),
+            "biome" => Some(Val::scalar(biome_desert)),
             "gbufferModelView" => {
                 let mut m = Val::scalar(0.0);
                 m.v[1] = 9.0; // column 0, row 1
