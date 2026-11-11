@@ -220,6 +220,14 @@ def main():
     if gradle is None:
         candidates = list((Path.home() / '.gradle/wrapper/dists/gradle-8.14-all').glob('*/gradle-8.14/bin/gradle' + ('.bat' if os.name == 'nt' else '')))
         if not candidates:
+            # gradle/actions/setup-gradle leaves 8.14 on PATH, which is where
+            # the release driver (android_release.py) finds it: it calls this
+            # script with no --gradle of its own. The version is checked so a
+            # different Gradle on PATH is not quietly used.
+            on_path = shutil.which('gradle')
+            if on_path and re.search(r'Gradle 8\.14\b', subprocess.run([on_path, '--version'], capture_output=True, text=True).stdout):
+                candidates = [on_path]
+        if not candidates:
             raise FileNotFoundError('Install Gradle 8.14 or pass --gradle PATH')
         gradle = candidates[0]
     environment['ANDROID_HOME'] = str(args.sdk)
